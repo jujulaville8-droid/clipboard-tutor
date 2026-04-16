@@ -13,10 +13,21 @@ DEMO_MODE = "--demo" in sys.argv
 READINGS_DIR = os.path.expanduser("~/clipboard-tutor/readings")
 
 SYSTEM_PROMPT = (
-    "You are a study helper. "
-    "If the question has multiple choice options (A, B, C, D, etc.), respond with ONLY the correct letter. Nothing else. "
-    "For all other questions, give a concise, accurate answer in 2-4 sentences. "
-    "Lead with the answer directly. No disclaimers or preamble."
+    "You are helping a university student study. "
+    "Answer from your general knowledge directly — do not try to read any files. "
+    "If the question has multiple choice options (A, B, C, D, etc.), respond with ONLY the correct letter(s). Nothing else. "
+    "If there is more than one correct answer, return the letters separated by commas (e.g. 'A, C') — no more than 5 characters total. "
+    "For all other questions, answer in 2-4 sentences as if you're a student writing a quick note to yourself. "
+    "Write like a real person, not an AI: "
+    "use plain, everyday language; contractions are fine; vary sentence length naturally; "
+    "do not use em dashes (—), semicolons, or bullet points; "
+    "do not hedge with phrases like 'it's worth noting', 'essentially', 'fundamentally', 'in essence', 'ultimately', or 'at its core'; "
+    "do not start with 'The answer is' or restate the question; "
+    "skip transitional words like 'moreover', 'furthermore', 'however' at the start of sentences; "
+    "avoid tricolons (lists of three) and overly balanced/polished phrasing; "
+    "just state the point directly, the way a smart student would jot it down. "
+    "Never use direct quotations from the readings — always paraphrase in your own words. "
+    "No preamble, no disclaimers, no meta-commentary."
 )
 
 
@@ -35,36 +46,88 @@ def set_clipboard(text):
 
 
 def notify(answer):
-    label = answer.strip()
-    # only show the toast for single-letter MCQ answers
-    if len(label) != 1:
+    # strip trailing punctuation
+    raw = answer.strip().rstrip(".").upper()
+    import re
+    # case 1: compact form like "ABD" or "AC" — all letters, no separators, short
+    if re.fullmatch(r"[A-Z]{1,6}", raw):
+        letters = list(raw)
+    else:
+        # case 2: separated form like "A, C", "A AND C", "A & C"
+        letters = re.findall(r"(?<![A-Z])[A-Z](?![A-Z])", raw)
+    if not letters or len(letters) > 6:
+        log(f"toast skipped: parsed letters={letters} from answer={repr(answer[:60])}")
         return
-    win_w, win_h, font_size, duration = 26, 18, 11, 1.5
-    script = f'''
-use framework "AppKit"
-use scripting additions
+    label = ", ".join(letters)
+    log(f"toast firing: {label}")
+    # dynamic width based on character count (rough: ~9px per char + padding)
+    char_count = len(label)
+    win_w = max(26, 10 + char_count * 9)
+    win_h, font_size, duration = 18, 11, 2.0
+    # Use a PyObjC-based approach via python so window can appear over fullscreen apps.
+    # Falls back silently if pyobjc not available.
+    py_script = f'''
+from AppKit import (
+    NSApplication, NSWindow, NSColor, NSTextField, NSFont, NSScreen,
+    NSMakeRect, NSApplicationActivationPolicyAccessory,
+    NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSWindowCollectionBehaviorStationary,
+    NSWindowCollectionBehaviorIgnoresCycle,
+    NSTextAlignmentCenter,
+)
+from Foundation import NSRunLoop, NSDate
 
-set theRect to current application's NSMakeRect(10, 10, {win_w}, {win_h})
-set theWindow to current application's NSWindow's alloc()'s initWithContentRect:theRect styleMask:0 backing:2 defer:false
-theWindow's setBackgroundColor:(current application's NSColor's blackColor)
-theWindow's setOpaque:false
-theWindow's setLevel:1000
-theWindow's setIgnoresMouseEvents:true
+app = NSApplication.sharedApplication()
+app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
-set theText to current application's NSTextField's labelWithString:"{label}"
-theText's setFont:(current application's NSFont's boldSystemFontOfSize:{font_size})
-theText's setTextColor:(current application's NSColor's whiteColor)
-theText's setAlignment:(current application's NSTextAlignmentCenter)
-theText's setBackgroundColor:(current application's NSColor's clearColor)
-theText's setBordered:false
-theText's setFrame:(current application's NSMakeRect(2, 2, {win_w - 4}, {win_h - 2}))
-theWindow's contentView()'s addSubview:theText
+# Position in bottom-left of the visible frame (excludes Dock and menu bar)
+screen = NSScreen.mainScreen()
+visible = screen.visibleFrame()
+x = visible.origin.x + 12
+y = visible.origin.y + 12
+rect = NSMakeRect(x, y, {win_w}, {win_h})
+win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(rect, 0, 2, False)
+win.setBackgroundColor_(NSColor.blackColor())
+win.setOpaque_(False)
+win.setLevel_(1000)
+win.setIgnoresMouseEvents_(True)
+win.setCollectionBehavior_(
+    NSWindowCollectionBehaviorCanJoinAllSpaces
+    | NSWindowCollectionBehaviorFullScreenAuxiliary
+    | NSWindowCollectionBehaviorStationary
+    | NSWindowCollectionBehaviorIgnoresCycle
+)
 
-theWindow's orderFrontRegardless()
-delay {duration}
-theWindow's orderOut:missing value
+label = NSTextField.labelWithString_("{label}")
+label.setFont_(NSFont.boldSystemFontOfSize_({font_size}))
+label.setTextColor_(NSColor.whiteColor())
+label.setAlignment_(NSTextAlignmentCenter)
+label.setBackgroundColor_(NSColor.clearColor())
+label.setBordered_(False)
+label.setFrame_(NSMakeRect(2, 2, {win_w - 4}, {win_h - 2}))
+win.contentView().addSubview_(label)
+
+win.makeKeyAndOrderFront_(None)
+win.orderFrontRegardless()
+
+# Pump the run loop until duration expires, so the window actually stays visible.
+end = NSDate.dateWithTimeIntervalSinceNow_({duration})
+NSRunLoop.currentRunLoop().runUntilDate_(end)
+win.orderOut_(None)
 '''
-    subprocess.Popen(["osascript", "-e", script], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    proc = subprocess.Popen(
+        [sys.executable, "-c", py_script],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+    # Give it a moment to fail fast; don't block on the full duration.
+    try:
+        _, err = proc.communicate(timeout=0.3)
+        if proc.returncode != 0 and err:
+            log(f"toast error: {err.decode(errors='replace').strip()[:200]}")
+    except subprocess.TimeoutExpired:
+        pass  # still running, that's fine
 
 
 def extract_question(text):
@@ -86,10 +149,10 @@ def ask_claude(client, question):
     prompt = SYSTEM_PROMPT + "\n\n" + question
     log("Calling claude...")
     escaped = prompt.replace("'", "'\\''")
-    cmd = f"claude -p '{escaped}' --add-dir '{READINGS_DIR}' --allowed-tools 'Read'"
+    cmd = f"claude -p '{escaped}' --allowed-tools ''"
     result = subprocess.run(
         cmd,
-        capture_output=True, text=True, timeout=60, shell=True,
+        capture_output=True, text=True, timeout=180, shell=True,
         executable="/bin/zsh"
     )
     log(f"claude returned: code={result.returncode} stdout={repr(result.stdout[:100])} stderr={repr(result.stderr[:100])}")
@@ -110,6 +173,15 @@ def main():
         if result.returncode != 0:
             print("Error: 'claude' CLI not found. Make sure Claude Code is installed.")
             sys.exit(1)
+
+    # verify the toast can work (needs pyobjc)
+    try:
+        import AppKit  # noqa: F401
+        log("AppKit available — fullscreen toast enabled.")
+    except ImportError:
+        log(f"WARNING: AppKit not available in {sys.executable}")
+        log("  Toast will not show. Install with:")
+        log(f"  {sys.executable} -m pip install pyobjc-framework-Cocoa")
 
     # count readings
     pdf_count = len([f for f in os.listdir(READINGS_DIR) if f.endswith(".pdf")]) if os.path.isdir(READINGS_DIR) else 0
